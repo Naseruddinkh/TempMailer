@@ -1,8 +1,9 @@
+const path = require("path");
 const express = require("express");
 const helmet = require("helmet");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
-const session = require("express-session");
+const cookieSession = require("cookie-session");
 
 const config = require("./config");
 const emailRoutes = require("./routes/email.routes");
@@ -10,29 +11,30 @@ const emailRoutes = require("./routes/email.routes");
 const app = express();
 
 app.disable("x-powered-by");
+app.set("trust proxy", 1);
 
 app.use(helmet());
 
-app.use(
-  cors({
-    origin: config.allowedOrigin,
-    credentials: true,
-    exposedHeaders: ["Content-Disposition"]
-  })
-);
+// The deployed frontend and API are same-origin, but CORS remains available
+// for local development or a separately hosted frontend.
+if (config.allowedOrigin) {
+  app.use(
+    cors({
+      origin: config.allowedOrigin,
+      credentials: true,
+      exposedHeaders: ["Content-Disposition"]
+    })
+  );
+}
 
 app.use(
-  session({
+  cookieSession({
     name: "tempmailer.sid",
-    secret: config.sessionSecret,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      httpOnly: true,
-      secure: config.nodeEnv === "production",
-      sameSite: "lax",
-      maxAge: 2 * 60 * 60 * 1000
-    }
+    keys: [config.sessionSecret],
+    httpOnly: true,
+    secure: config.nodeEnv === "production",
+    sameSite: "lax",
+    maxAge: 2 * 60 * 60 * 1000
   })
 );
 
@@ -56,9 +58,8 @@ const mailboxCreationLimiter = rateLimit({
   }
 });
 
-app.post("/api/mailboxes", mailboxCreationLimiter);
-
 app.use("/api", apiLimiter);
+app.post("/api/mailboxes", mailboxCreationLimiter);
 
 app.get("/api/health", (req, res) => {
   const body = { status: "ok", service: "tempmailer" };
@@ -68,12 +69,15 @@ app.get("/api/health", (req, res) => {
 
 app.use("/api", emailRoutes);
 
+// Serve the postal-theme frontend from Vercel/Express.
+// express.static automatically serves public/index.html at /.
+app.use(express.static(path.join(__dirname, "../public")));
+
 app.use((req, res) => {
   res.status(404).json({ error: "Not found" });
 });
 
 app.use((err, req, res, next) => {
-  // Log safely — never log err.config.headers (contains API keys)
   console.error({
     message: err.message,
     code: err.code,
@@ -81,7 +85,6 @@ app.use((err, req, res, next) => {
     url: err.config?.url
   });
 
-  // JSON parsing error
   if (err.type === "entity.parse.failed") {
     return res.status(400).json({
       error: "Invalid JSON",
@@ -89,7 +92,6 @@ app.use((err, req, res, next) => {
     });
   }
 
-  // Axios / upstream API errors
   if (err.response) {
     const status = err.response.status;
 
@@ -120,7 +122,6 @@ app.use((err, req, res, next) => {
     });
   }
 
-  // Network / timeout errors
   if (err.code === "ECONNABORTED" || err.code === "ETIMEDOUT") {
     return res.status(503).json({
       error: "Temporary email service timed out",
@@ -128,14 +129,10 @@ app.use((err, req, res, next) => {
     });
   }
 
-  // Errors where a route explicitly provides a status code
   if (err.statusCode) {
-    return res.status(err.statusCode).json({
-      error: err.message
-    });
+    return res.status(err.statusCode).json({ error: err.message });
   }
 
-  // Generic unexpected error
   return res.status(500).json({
     error: "Internal server error",
     code: "INTERNAL_ERROR"

@@ -6,12 +6,17 @@ const config = require("../config");
 
 const router = express.Router();
 
-// In-memory MVP mailbox registry.
-// Replace with Redis/database-backed sessions before production.
-const mailboxes = new Map();
+// Mailbox identity is stored in the signed, HTTP-only cookie session.
+// This avoids relying on Vercel function memory between requests.
+function sanitizeMailbox(mailbox) {
+  return {
+    id: mailbox.id,
+    email: mailbox.email,
+    domain: mailbox.domain,
+    createdAt: mailbox.createdAt
+  };
+}
 
-// ── Response sanitizers ─────────────────────────────────────────
-// Whitelist fields from upstream API to prevent accidental data leaks.
 function sanitizeInboxMessage(msg) {
   return {
     id: msg.mail_id || msg._id || msg.id,
@@ -34,50 +39,33 @@ function sanitizeFullMessage(msg) {
     attachmentsCount: msg.mail_attachments_count || 0
   };
 }
-// ────────────────────────────────────────────────────────────────
-
-function cleanupExpiredMailboxes() {
-  const now = Date.now();
-
-  for (const [id, mailbox] of mailboxes.entries()) {
-    const createdAt = new Date(mailbox.createdAt).getTime();
-
-    if (now - createdAt >= config.mailboxTtl) {
-      mailboxes.delete(id);
-
-      console.log(`Expired mailbox removed: ${id}`);
-    }
-  }
-}
-
-setInterval(cleanupExpiredMailboxes, 60 * 1000).unref();
 
 function getSessionMailbox(req) {
-  const mailboxId = req.session.mailboxId;
+  const mailbox = req.session?.mailbox;
 
-  if (!mailboxId) {
+  if (!mailbox) return null;
+
+  const createdAt = new Date(mailbox.createdAt).getTime();
+  if (!Number.isFinite(createdAt) || Date.now() - createdAt >= config.mailboxTtl) {
+    req.session = null;
     return null;
   }
 
-  return mailboxes.get(mailboxId) || null;
+  return mailbox;
 }
 
 async function requireSessionMessage(req, res) {
   const mailbox = getSessionMailbox(req);
 
   if (!mailbox) {
-    res.status(401).json({
-      error: "No active mailbox"
-    });
+    res.status(401).json({ error: "No active mailbox" });
     return null;
   }
 
   const messages = await tempmail.getInbox(mailbox.email);
 
   if (!Array.isArray(messages)) {
-    res.status(404).json({
-      error: "Message not found"
-    });
+    res.status(404).json({ error: "Message not found" });
     return null;
   }
 
@@ -88,16 +76,11 @@ async function requireSessionMessage(req, res) {
   );
 
   if (!message) {
-    res.status(404).json({
-      error: "Message not found"
-    });
+    res.status(404).json({ error: "Message not found" });
     return null;
   }
 
-  return {
-    mailbox,
-    message
-  };
+  return { mailbox, message };
 }
 
 router.get("/domains", async (req, res, next) => {
@@ -111,7 +94,6 @@ router.get("/domains", async (req, res, next) => {
 
 router.post("/mailboxes", async (req, res, next) => {
   try {
-    // Reject unexpected body content
     if (req.body && Object.keys(req.body).length > 0) {
       return res.status(400).json({
         error: "Request body not accepted",
@@ -119,10 +101,7 @@ router.post("/mailboxes", async (req, res, next) => {
       });
     }
 
-    // Fetch the latest available domains
     const domains = await tempmail.getDomains();
-
-    // Normalize possible upstream response shapes
     const availableDomains = Array.isArray(domains)
       ? domains
       : Array.isArray(domains?.domains)
@@ -136,24 +115,16 @@ router.post("/mailboxes", async (req, res, next) => {
       });
     }
 
-    // Randomly select one available domain
     const selectedDomain =
       availableDomains[crypto.randomInt(0, availableDomains.length)];
 
-    // Generate the mailbox using the selected domain
     const mailbox = createMailbox(selectedDomain);
 
-    mailboxes.set(mailbox.id, mailbox);
+    req.session = {
+      mailbox
+    };
 
-    // Associate mailbox with current browser session
-    req.session.mailboxId = mailbox.id;
-
-    return res.status(201).json({
-      id: mailbox.id,
-      email: mailbox.email,
-      domain: mailbox.domain,
-      createdAt: mailbox.createdAt
-    });
+    return res.status(201).json(sanitizeMailbox(mailbox));
   } catch (err) {
     next(err);
   }
@@ -162,20 +133,11 @@ router.post("/mailboxes", async (req, res, next) => {
 router.get("/session", (req, res) => {
   const mailbox = getSessionMailbox(req);
 
-  if (!mailbox) {
-    return res.json({
-      active: false
-    });
-  }
+  if (!mailbox) return res.json({ active: false });
 
   return res.json({
     active: true,
-    mailbox: {
-      id: mailbox.id,
-      email: mailbox.email,
-      domain: mailbox.domain,
-      createdAt: mailbox.createdAt
-    }
+    mailbox: sanitizeMailbox(mailbox)
   });
 });
 
@@ -183,17 +145,10 @@ router.get("/mailbox", (req, res) => {
   const mailbox = getSessionMailbox(req);
 
   if (!mailbox) {
-    return res.status(404).json({
-      error: "No active mailbox"
-    });
+    return res.status(404).json({ error: "No active mailbox" });
   }
 
-  return res.json({
-    id: mailbox.id,
-    email: mailbox.email,
-    domain: mailbox.domain,
-    createdAt: mailbox.createdAt
-  });
+  return res.json(sanitizeMailbox(mailbox));
 });
 
 router.get("/mailbox/messages", async (req, res, next) => {
@@ -201,14 +156,10 @@ router.get("/mailbox/messages", async (req, res, next) => {
     const mailbox = getSessionMailbox(req);
 
     if (!mailbox) {
-      return res.status(404).json({
-        error: "No active mailbox"
-      });
+      return res.status(404).json({ error: "No active mailbox" });
     }
 
     const data = await tempmail.getInbox(mailbox.email);
-
-    // Whitelist fields to prevent upstream data leaks
     const sanitized = Array.isArray(data)
       ? data.map(sanitizeInboxMessage)
       : data;
@@ -222,35 +173,22 @@ router.get("/mailbox/messages", async (req, res, next) => {
 router.get("/mailboxes/:mailboxId", (req, res) => {
   const mailbox = getSessionMailbox(req);
 
-  // Unified 404 prevents IDOR enumeration (no 401 vs 403 distinction)
   if (!mailbox || mailbox.id !== req.params.mailboxId) {
-    return res.status(404).json({
-      error: "Mailbox not found"
-    });
+    return res.status(404).json({ error: "Mailbox not found" });
   }
 
-  res.json({
-    id: mailbox.id,
-    email: mailbox.email,
-    domain: mailbox.domain,
-    createdAt: mailbox.createdAt
-  });
+  res.json(sanitizeMailbox(mailbox));
 });
 
 router.get("/mailboxes/:mailboxId/messages", async (req, res, next) => {
   try {
     const mailbox = getSessionMailbox(req);
 
-    // Unified 404 prevents IDOR enumeration
     if (!mailbox || mailbox.id !== req.params.mailboxId) {
-      return res.status(404).json({
-        error: "Mailbox not found"
-      });
+      return res.status(404).json({ error: "Mailbox not found" });
     }
 
     const data = await tempmail.getInbox(mailbox.email);
-
-    // Whitelist fields to prevent upstream data leaks
     const sanitized = Array.isArray(data)
       ? data.map(sanitizeInboxMessage)
       : data;
@@ -264,12 +202,9 @@ router.get("/mailboxes/:mailboxId/messages", async (req, res, next) => {
 router.get("/messages/:messageId", async (req, res, next) => {
   try {
     const access = await requireSessionMessage(req, res);
-
     if (!access) return;
 
     const data = await tempmail.getMessage(req.params.messageId);
-
-    // Whitelist fields to prevent upstream data leaks
     res.json(sanitizeFullMessage(data));
   } catch (err) {
     next(err);
@@ -279,11 +214,9 @@ router.get("/messages/:messageId", async (req, res, next) => {
 router.delete("/messages/:messageId", async (req, res, next) => {
   try {
     const access = await requireSessionMessage(req, res);
-
     if (!access) return;
 
     const data = await tempmail.deleteMessage(req.params.messageId);
-
     res.json(data);
   } catch (err) {
     next(err);
@@ -293,11 +226,9 @@ router.delete("/messages/:messageId", async (req, res, next) => {
 router.get("/messages/:messageId/source", async (req, res, next) => {
   try {
     const access = await requireSessionMessage(req, res);
-
     if (!access) return;
 
     const data = await tempmail.getSource(req.params.messageId);
-
     res.json(data);
   } catch (err) {
     next(err);
@@ -307,7 +238,6 @@ router.get("/messages/:messageId/source", async (req, res, next) => {
 router.get("/messages/:messageId/attachments", async (req, res, next) => {
   try {
     const access = await requireSessionMessage(req, res);
-
     if (!access) return;
 
     const data = await tempmail.getAttachments(req.params.messageId);
@@ -322,7 +252,6 @@ router.get(
   async (req, res, next) => {
     try {
       const access = await requireSessionMessage(req, res);
-
       if (!access) return;
 
       const attachment = await tempmail.getAttachment(
@@ -330,21 +259,16 @@ router.get(
         req.params.attachmentId
       );
 
-      // Strip everything except safe ASCII chars and truncate
       const safeFilename = attachment.filename
         .replace(/[^\w.\-]/g, "_")
         .substring(0, 255);
 
-      // Force safe content-type to prevent XSS via attacker-controlled MIME
       res.setHeader("Content-Type", "application/octet-stream");
-
       res.setHeader(
         "Content-Disposition",
         `attachment; filename="${safeFilename}"`
       );
-
       res.setHeader("X-Content-Type-Options", "nosniff");
-
       res.send(attachment.content);
     } catch (err) {
       next(err);
